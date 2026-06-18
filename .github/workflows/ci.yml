@@ -1,0 +1,168 @@
+name: Build, Scan, Test and Publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "dockerfiles/**"
+      - "tests/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "dockerfiles/**"
+      - "tests/**"
+      - ".github/workflows/ci.yml"
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Discover every *.dockerfile in dockerfiles/
+  # and expose the list as a JSON array for the
+  # matrix jobs below.
+  # ──────────────────────────────────────────────
+  prepare:
+    name: Discover images
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.list.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: List Dockerfiles
+        id: list
+        run: |
+          images=$(
+            find dockerfiles -name "*.dockerfile" \
+              | sed 's|^dockerfiles/||; s|\.dockerfile$||' \
+              | sort \
+              | jq -R -s -c 'split("\n") | map(select(length > 0))'
+          )
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "Found images: $images"
+
+  # ──────────────────────────────────────────────
+  # Build → Scan → Test
+  # Runs for every image in parallel.
+  # The scan uploads a SARIF report to the GitHub
+  # Security tab and fails on CRITICAL/HIGH CVEs.
+  # Tests mount tests/<image>/ into the container
+  # and execute test.sh inside it.
+  # ──────────────────────────────────────────────
+  build-scan-test:
+    name: Build / Scan / Test – ${{ matrix.image }}
+    needs: prepare
+    if: needs.prepare.outputs.images != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.prepare.outputs.images) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: dockerfiles/${{ matrix.image }}.dockerfile
+          push: false
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Upload Trivy SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-${{ matrix.image }}
+
+      - name: Run tests
+        run: |
+          test_dir="tests/${{ matrix.image }}"
+          test_script="${test_dir}/test.sh"
+
+          if [ ! -f "$test_script" ]; then
+            echo "No test script found at $test_script — skipping tests."
+            exit 0
+          fi
+
+          echo "Running tests from $test_script …"
+          docker run --rm \
+            --volume "${{ github.workspace }}/${test_dir}:/tests:ro" \
+            "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci" \
+            /bin/sh /tests/test.sh
+
+  # ──────────────────────────────────────────────
+  # Publish
+  # Only runs on push to main after all
+  # build-scan-test jobs pass.
+  # Images are tagged with the Git SHA and 'latest'.
+  # ──────────────────────────────────────────────
+  publish:
+    name: Publish – ${{ matrix.image }}
+    needs: [prepare, build-scan-test]
+    if: >
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.prepare.outputs.images != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.prepare.outputs.images) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: dockerfiles/${{ matrix.image }}.dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
