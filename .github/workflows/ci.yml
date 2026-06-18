@@ -26,6 +26,8 @@ jobs:
   prepare:
     name: Discover images
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       images: ${{ steps.list.outputs.images }}
     steps:
