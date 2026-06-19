@@ -93,7 +93,7 @@ Changes to files outside `dockerfiles/`, `tests/`, or the workflow files do **no
 1. **prepare** — discovers all `*.dockerfile` files (including subfolders) and creates a build matrix filtered to only changed images.
 2. **build-scan-test** — for each image in parallel:
    - Builds the image with [Docker Buildx](https://docs.docker.com/buildx/) (layer cache stored in GitHub Actions cache).
-   - Scans the image with [Trivy](https://aquasecurity.github.io/trivy/): `CRITICAL`/`HIGH` findings are uploaded to **Security → Code scanning** (SARIF) and fail the job; a PR comment also shows `CRITICAL`/`HIGH`/`MEDIUM` results per image.
+   - Scans the image with [Trivy](https://aquasecurity.github.io/trivy/): all severities are uploaded to **Security → Code scanning** (SARIF), while `CRITICAL`/`HIGH` (unfixed only) still fail the job; a PR comment also shows findings per image for all severities.
    - For flat images, mounts `tests/<image>/` and runs `test.sh`. For folder images, mounts `tests/<folder>/` and runs `test.sh` (shared) then `<image>.sh` (specific). Steps are skipped if the scripts don't exist.
 3. **publish** — (main branch only, after scan and test pass) builds the image again from the GHA layer cache and pushes it to GHCR.
 
@@ -199,5 +199,5 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password
 
 - Trivy scans run on every build and block publishing on `CRITICAL` or `HIGH` CVEs.
 - On pull requests, CI also posts a Trivy comment for each scanned image with counts and findings for all severities (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `UNKNOWN`).
-- `CRITICAL`/`HIGH` results are uploaded to **Security → Code scanning** in this repository.
+- Trivy SARIF uploads include all severities (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `UNKNOWN`) in **Security → Code scanning**.
 - Dependabot keeps base images up-to-date, and the age-check workflow ensures only stable (≥ 7-day-old) images are pulled in.

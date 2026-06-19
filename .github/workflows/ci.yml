@@ -145,15 +145,15 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
-      - name: Scan image with Trivy
+      - name: Scan image with Trivy for SARIF upload
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
           format: sarif
           output: trivy-results.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: "1"
+          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
+          ignore-unfixed: false
+          exit-code: "0"
 
       - name: Upload Trivy SARIF results
         uses: github/codeql-action/upload-sarif@v4.36.2
@@ -161,6 +161,15 @@ jobs:
         with:
           sarif_file: trivy-results.sarif
           category: trivy-${{ matrix.image }}
+
+      - name: Enforce Trivy policy (CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
 
       - name: Scan image with Trivy for PR summary
         if: github.event_name == 'pull_request'
