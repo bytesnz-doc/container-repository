@@ -198,6 +198,6 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password
 ## Security
 
 - Trivy scans run on every build and block publishing on `CRITICAL` or `HIGH` CVEs.
-- On pull requests, CI also posts a Trivy comment for each scanned image with `CRITICAL`/`HIGH`/`MEDIUM` counts and top findings.
+- On pull requests, CI also posts a Trivy comment for each scanned image with counts and findings for all severities (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `UNKNOWN`).
 - `CRITICAL`/`HIGH` results are uploaded to **Security → Code scanning** in this repository.
 - Dependabot keeps base images up-to-date, and the age-check workflow ensures only stable (≥ 7-day-old) images are pulled in.

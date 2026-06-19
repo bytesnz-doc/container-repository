@@ -169,8 +169,8 @@ jobs:
           image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
           format: json
           output: trivy-results-pr.json
-          severity: CRITICAL,HIGH,MEDIUM
-          ignore-unfixed: true
+          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
+          ignore-unfixed: false
           exit-code: "0"
 
       - name: Build Trivy PR summary
@@ -181,7 +181,9 @@ jobs:
           critical=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results-pr.json)
           high=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-results-pr.json)
           medium=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-results-pr.json)
-          total=$((critical + high + medium))
+          low=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-results-pr.json)
+          unknown=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="UNKNOWN")] | length' trivy-results-pr.json)
+          total=$((critical + high + medium + low + unknown))
 
           {
             echo "<!-- trivy-pr-comment:${{ matrix.image }} -->"
@@ -192,24 +194,26 @@ jobs:
             echo "| CRITICAL | ${critical} |"
             echo "| HIGH | ${high} |"
             echo "| MEDIUM | ${medium} |"
+            echo "| LOW | ${low} |"
+            echo "| UNKNOWN | ${unknown} |"
             echo
             if [ "$total" -eq 0 ]; then
-              echo "No CRITICAL/HIGH/MEDIUM vulnerabilities found."
+              echo "No vulnerabilities found."
             else
-              echo "<details><summary>Top findings (up to 20)</summary>"
+              echo "<details><summary>All findings (${total})</summary>"
               echo
               echo "| Severity | ID | Package | Installed | Fixed |"
               echo "| --- | --- | --- | --- | --- |"
               jq -r '
-                [.Results[]?.Vulnerabilities[]?
-                  | select(.Severity=="CRITICAL" or .Severity=="HIGH" or .Severity=="MEDIUM")]
+                [.Results[]?.Vulnerabilities[]?]
                 | sort_by(
                     if .Severity=="CRITICAL" then 0
                     elif .Severity=="HIGH" then 1
-                    else 2 end,
+                    elif .Severity=="MEDIUM" then 2
+                    elif .Severity=="LOW" then 3
+                    else 4 end,
                     .VulnerabilityID
                   )
-                | .[:20]
                 | .[]
                 | [
                     .Severity,
