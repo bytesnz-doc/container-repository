@@ -12,7 +12,8 @@ A GitHub-hosted container registry providing base images. Images are built, scan
 │   ├── dependabot.yml               # Automated base-image update PRs
 │   └── workflows/
 │       ├── ci.yml                   # Build → Scan → Test → Publish pipeline
-│       └── dependabot-age-check.yml # Reject Dependabot PRs for images < 7 days old
+│       ├── dependabot-age-check.yml # Reject Dependabot PRs for images < 7 days old
+│       └── dependabot-retry.yml     # Daily: re-check ages and unblock PRs automatically
 ├── dockerfiles/
 │   └── alpine.dockerfile            # One file per image; filename = image name
 ├── tests/
@@ -44,6 +45,12 @@ A GitHub-hosted container registry providing base images. Images are built, scan
 │  │  (≥ 7 days old?)  │   │  (Build / Scan / Test)       │  │
 │  └───────────────────┘   └──────────────────────────────┘  │
 │  Both must pass before the PR can be merged.                │
+│                                                             │
+│  If the age check fails on day 0:                           │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  Daily retry (04:00 UTC)                             │   │
+│  │  Re-checks ages → re-runs failed checks when ready  │   │
+│  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -89,9 +96,26 @@ Changes to files outside `dockerfiles/`, `tests/`, or the workflow files do **no
 
 Dependabot checks `dockerfiles/` weekly (Monday 03:00 NZST) and opens PRs when newer base-image tags are available.
 
-An additional workflow (`dependabot-age-check.yml`) verifies that every updated base image was published at least **7 days** before the PR can be merged. This protects against pulling in a brand-new image that may not yet have been vetted by the community.
+#### Age gate (`dependabot-age-check.yml`)
 
-To enforce the age check as a **required status check**:
+This workflow runs on every Dependabot PR and verifies that every updated base image was published at least **7 days** ago before the PR can be merged. This protects against pulling in a brand-new image that may not yet have been vetted by the community.
+
+#### Daily retry (`dependabot-retry.yml`)
+
+If the age check fails on day 0 (the image is too new), nothing would normally re-trigger the workflow — the PR would sit blocked indefinitely. The daily retry workflow solves this:
+
+1. Runs every day at **04:00 UTC** (and on demand via `workflow_dispatch`).
+2. Finds all open Dependabot PRs that touch `dockerfiles/`.
+3. For each PR, fetches the Dockerfile at the PR's head commit and re-checks the base image age via the Docker Hub API.
+4. If all images are now ≥ 7 days old → re-runs all failed/cancelled workflow runs on that commit, triggering the age check and the full CI pipeline from scratch.
+5. If images are still too new → logs the remaining wait and checks again tomorrow.
+
+No human intervention is required. PRs are unblocked automatically the day the age gate clears.
+
+#### Required status checks
+
+To enforce the age gate, add `Check base image age` as a **required status check** in your branch protection rules:
+
 1. Go to **Settings → Branches → Branch protection rules** for `main`.
 2. Enable **Require status checks to pass before merging**.
 3. Add `Check base image age` to the required checks list.

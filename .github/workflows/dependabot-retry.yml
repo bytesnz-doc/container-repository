@@ -1,0 +1,162 @@
+name: Dependabot Daily Retry
+
+# Runs every day at 04:00 UTC (and on demand).
+#
+# Problem this solves:
+#   Dependabot opens a PR → the age-check workflow fails because the base
+#   image is < 7 days old → nothing ever re-triggers it → the PR sits
+#   blocked forever.
+#
+# How it works:
+#   1. Find every open Dependabot PR that changes a Dockerfile.
+#   2. For each PR, fetch the Dockerfile at the PR's head SHA and check
+#      whether all updated base images are now ≥ MIN_AGE_DAYS old.
+#   3. If yes → re-run all failed / cancelled workflow runs on that
+#      commit so the age-check and CI pipeline execute again from scratch.
+#   4. If no  → log it and check again tomorrow.
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # 04:00 UTC daily
+  workflow_dispatch: # allow manual trigger
+
+permissions:
+  actions: write # re-run workflow runs
+  contents: read
+  pull-requests: read
+
+jobs:
+  retry-dependabot-prs:
+    name: Re-check Dependabot PRs
+    runs-on: ubuntu-latest
+    env:
+      MIN_AGE_DAYS: 7
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Check open Dependabot PRs and retry if images are old enough
+        run: |
+          set -euo pipefail
+
+          MIN_SECS=$(( MIN_AGE_DAYS * 86400 ))
+          NOW=$(date +%s)
+          REPO="${GITHUB_REPOSITORY}"
+
+          echo "=== Checking open Dependabot PRs in ${REPO} ==="
+
+          # List open PRs authored by Dependabot that touch Dockerfiles.
+          # --search uses GitHub's search syntax; app/dependabot matches the bot.
+          prs=$(gh pr list \
+            --repo "$REPO" \
+            --state open \
+            --search "author:app/dependabot" \
+            --json number,headRefOid)
+
+          pr_count=$(echo "$prs" | jq 'length')
+          echo "Found ${pr_count} open Dependabot PR(s)."
+
+          echo "$prs" | jq -c '.[]' | while read -r pr; do
+            pr_number=$(echo "$pr" | jq -r '.number')
+            head_sha=$(echo "$pr" | jq -r '.headRefOid')
+
+            echo ""
+            echo "--- PR #${pr_number} (head: ${head_sha})"
+
+            # Find Dockerfiles changed in this PR.
+            changed_dockerfiles=$(gh pr view "$pr_number" \
+              --repo "$REPO" \
+              --json files \
+              --jq '[.files[].path | select(startswith("dockerfiles/") and endswith(".dockerfile"))] | .[]')
+
+            if [ -z "$changed_dockerfiles" ]; then
+              echo "    No Dockerfiles changed — skipping."
+              continue
+            fi
+
+            echo "    Changed Dockerfiles: $(echo "$changed_dockerfiles" | tr '\n' ' ')"
+
+            ALL_PASS=true
+
+            while IFS= read -r dockerfile; do
+              [ -z "$dockerfile" ] && continue
+
+              # Fetch file content at the PR head SHA via the GitHub API.
+              content=$(gh api "repos/${REPO}/contents/${dockerfile}?ref=${head_sha}" \
+                --jq '.content' | base64 --decode)
+
+              base_image=$(echo "$content" | grep -iE '^FROM[[:space:]]' | tail -1 | awk '{print $2}')
+              echo "    Base image: ${base_image}"
+
+              # Parse name and tag.
+              if [[ "$base_image" == *:* ]]; then
+                image_name="${base_image%%:*}"
+                image_tag="${base_image##*:}"
+              else
+                image_name="$base_image"
+                image_tag="latest"
+              fi
+
+              # Build Docker Hub API URL (official images live under 'library/').
+              if [[ "$image_name" != */* ]]; then
+                api_url="https://hub.docker.com/v2/repositories/library/${image_name}/tags/${image_tag}"
+              else
+                api_url="https://hub.docker.com/v2/repositories/${image_name}/tags/${image_tag}"
+              fi
+
+              response=$(curl -sf "$api_url" || true)
+              if [ -z "$response" ]; then
+                echo "    WARNING: Could not query Docker Hub for ${base_image} — treating as old enough."
+                continue
+              fi
+
+              pushed_at=$(echo "$response" | jq -r '.tag_last_pushed // .last_updated // ""')
+              if [ -z "$pushed_at" ] || [ "$pushed_at" = "null" ]; then
+                echo "    WARNING: Push date unavailable for ${base_image} — treating as old enough."
+                continue
+              fi
+
+              pushed_ts=$(date -d "$pushed_at" +%s 2>/dev/null || echo "")
+              if [ -z "$pushed_ts" ]; then
+                echo "    WARNING: Could not parse date '${pushed_at}' — treating as old enough."
+                continue
+              fi
+
+              age_secs=$(( NOW - pushed_ts ))
+              age_days=$(( age_secs / 86400 ))
+
+              if [ "$age_secs" -lt "$MIN_SECS" ]; then
+                echo "    NOT READY: ${base_image} is ${age_days} day(s) old (need ${MIN_AGE_DAYS})."
+                ALL_PASS=false
+              else
+                echo "    READY: ${base_image} is ${age_days} day(s) old."
+              fi
+            done <<< "$changed_dockerfiles"
+
+            if [ "$ALL_PASS" = "false" ]; then
+              echo "    PR #${pr_number}: images not yet old enough — will retry tomorrow."
+              continue
+            fi
+
+            echo "    PR #${pr_number}: all images are old enough — re-running failed workflow runs."
+
+            # Find failed or cancelled runs for this commit and re-run them.
+            failed_runs=$(gh run list \
+              --repo "$REPO" \
+              --commit "$head_sha" \
+              --json databaseId,conclusion \
+              --jq '.[] | select(.conclusion == "failure" or .conclusion == "cancelled") | .databaseId')
+
+            if [ -z "$failed_runs" ]; then
+              echo "    No failed or cancelled workflow runs to re-run."
+            else
+              while IFS= read -r run_id; do
+                [ -z "$run_id" ] && continue
+                echo "    Re-running workflow run ${run_id} ..."
+                gh run rerun --failed "$run_id" --repo "$REPO" || \
+                  echo "    WARNING: Could not re-run ${run_id} (may already be running)."
+              done <<< "$failed_runs"
+            fi
+          done
+
+          echo ""
+          echo "=== Done ==="
