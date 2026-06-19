@@ -123,6 +123,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      pull-requests: write
     strategy:
       fail-fast: false
       matrix:
@@ -160,6 +161,118 @@ jobs:
         with:
           sarif_file: trivy-results.sarif
           category: trivy-${{ matrix.image }}
+
+      - name: Scan image with Trivy for PR summary
+        if: github.event_name == 'pull_request'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
+          format: json
+          output: trivy-results-pr.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
+          ignore-unfixed: false
+          exit-code: "0"
+
+      - name: Build Trivy PR summary
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+
+          critical=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results-pr.json)
+          high=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-results-pr.json)
+          medium=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-results-pr.json)
+          low=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-results-pr.json)
+          unknown=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="UNKNOWN")] | length' trivy-results-pr.json)
+          total=$((critical + high + medium + low + unknown))
+
+          {
+            echo "<!-- trivy-pr-comment:${{ matrix.image }} -->"
+            echo "### Trivy results: \`${{ matrix.image }}\`"
+            echo
+            echo "| Severity | Count |"
+            echo "| --- | ---: |"
+            echo "| CRITICAL | ${critical} |"
+            echo "| HIGH | ${high} |"
+            echo "| MEDIUM | ${medium} |"
+            echo "| LOW | ${low} |"
+            echo "| UNKNOWN | ${unknown} |"
+            echo
+            if [ "$total" -eq 0 ]; then
+              echo "No vulnerabilities found."
+            else
+              echo "<details><summary>All findings (${total})</summary>"
+              echo
+              echo "| Severity | ID | Package | Installed | Fixed |"
+              echo "| --- | --- | --- | --- | --- |"
+              jq -r '
+                [.Results[]?.Vulnerabilities[]?]
+                | sort_by(
+                    if .Severity=="CRITICAL" then 0
+                    elif .Severity=="HIGH" then 1
+                    elif .Severity=="MEDIUM" then 2
+                    elif .Severity=="LOW" then 3
+                    else 4 end,
+                    .VulnerabilityID
+                  )
+                | .[]
+                | [
+                    .Severity,
+                    (.VulnerabilityID // "N/A"),
+                    (.PkgName // "N/A"),
+                    (.InstalledVersion // "N/A"),
+                    (if (.FixedVersion // "") == "" then "-" else .FixedVersion end)
+                  ]
+                | @tsv
+              ' trivy-results-pr.json \
+              | while IFS=$'\t' read -r sev id pkg inst fixed; do
+                  printf '| %s | %s | %s | %s | %s |\n' "$sev" "$id" "$pkg" "$inst" "$fixed"
+                done
+              echo
+              echo "</details>"
+            fi
+          } > trivy-pr-summary.md
+
+          cat trivy-pr-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish Trivy summary comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8.0.0
+        env:
+          IMAGE_NAME: ${{ matrix.image }}
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('trivy-pr-summary.md', 'utf8');
+            const marker = `<!-- trivy-pr-comment:${process.env.IMAGE_NAME} -->`;
+            const issue_number = context.payload.pull_request.number;
+            const { owner, repo } = context.repo;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner,
+              repo,
+              issue_number,
+              per_page: 100
+            });
+
+            const existing = comments.find(
+              (c) => c.user?.type === 'Bot' && c.body?.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body
+              });
+            }
 
       - name: Run tests
         run: |
