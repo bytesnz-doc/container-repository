@@ -1,0 +1,114 @@
+name: Dependabot Image Age Check
+
+# Runs only on Dependabot PRs that touch Dockerfiles.
+# It verifies that every updated base image has been
+# published for at least MIN_AGE_DAYS before allowing
+# the PR to be merged.  Add this as a required status
+# check in your branch protection rules.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "dockerfiles/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check-image-age:
+    name: Check base image age
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    env:
+      MIN_AGE_DAYS: 7
+
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branch
+        run: git fetch origin main:refs/remotes/origin/main
+
+      - name: Identify changed Dockerfiles
+        id: changed
+        run: |
+          files=$(git diff --name-only refs/remotes/origin/main...HEAD | grep -E '^dockerfiles/.*\.dockerfile$')
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$files"     >> "$GITHUB_OUTPUT"
+          echo "EOF"        >> "$GITHUB_OUTPUT"
+          echo "Changed Dockerfiles: $files"
+
+      - name: Check base image ages
+        if: steps.changed.outputs.files != ''
+        run: |
+          set -euo pipefail
+
+          MIN_SECS=$(( MIN_AGE_DAYS * 86400 ))
+          NOW=$(date +%s)
+          PASS=true
+
+          while IFS= read -r dockerfile; do
+            [ -z "$dockerfile" ] && continue
+
+            # Extract the final FROM line (ignore build-stage aliases)
+            base_image=$(grep -iE '^FROM\s' "$dockerfile" | tail -1 | awk '{print $2}')
+            echo "--- Checking: $base_image (from $dockerfile)"
+
+            # Split image into name and tag
+            if [[ "$base_image" == *:* ]]; then
+              image_name="${base_image%%:*}"
+              image_tag="${base_image##*:}"
+            else
+              image_name="$base_image"
+              image_tag="latest"
+            fi
+
+            # Determine Docker Hub API URL
+            # Official images live under 'library/'
+            if [[ "$image_name" != */* ]]; then
+              api_url="https://hub.docker.com/v2/repositories/library/${image_name}/tags/${image_tag}"
+            else
+              api_url="https://hub.docker.com/v2/repositories/${image_name}/tags/${image_tag}"
+            fi
+
+            response=$(curl -sf "$api_url" || true)
+            if [ -z "$response" ]; then
+              echo "    WARNING: Could not query Docker Hub for $base_image — skipping age check."
+              continue
+            fi
+
+            pushed_at=$(echo "$response" | jq -r '.tag_last_pushed // .last_updated // ""')
+            if [ -z "$pushed_at" ] || [ "$pushed_at" = "null" ]; then
+              echo "    WARNING: Push date unavailable for $base_image — skipping age check."
+              continue
+            fi
+
+            pushed_ts=$(date -d "$pushed_at" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%S" "${pushed_at%%.*}" +%s 2>/dev/null || echo "")
+            if [ -z "$pushed_ts" ]; then
+              echo "    WARNING: Could not parse date '$pushed_at' — skipping age check."
+              continue
+            fi
+
+            age_secs=$(( NOW - pushed_ts ))
+            age_days=$(( age_secs / 86400 ))
+
+            if [ "$age_secs" -lt "$MIN_SECS" ]; then
+              echo "    FAIL: $base_image was published $age_days day(s) ago (minimum: $MIN_AGE_DAYS)."
+              PASS=false
+            else
+              echo "    PASS: $base_image is $age_days day(s) old."
+            fi
+          done <<< "${{ steps.changed.outputs.files }}"
+
+          if [ "$PASS" = "false" ]; then
+            echo ""
+            echo "One or more base images are newer than $MIN_AGE_DAYS days."
+            echo "Please wait until the image(s) are at least $MIN_AGE_DAYS days old before merging."
+            exit 1
+          fi
+
+          echo ""
+          echo "All updated base images are at least $MIN_AGE_DAYS days old. ✓"
