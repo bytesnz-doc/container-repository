@@ -23,6 +23,11 @@ jobs:
   # changed (or all of them if ci.yml changed) and
   # expose the list as a JSON array for the matrix
   # jobs below.
+  #
+  # Supports nested image folders, e.g.:
+  #   dockerfiles/developer/alpine.dockerfile
+  #   → image name: developer/alpine
+  #   → published:  ghcr.io/<org>/developer/alpine
   # ──────────────────────────────────────────────
   prepare:
     name: Discover changed images
@@ -64,17 +69,38 @@ jobs:
                 | jq -R -s -c 'split("\n") | map(select(length > 0))'
             )
           else
-            # Collect names from changed dockerfiles and test directories,
-            # then keep only those that have an actual dockerfile present.
+            # Derive affected image names from changed paths:
+            #   dockerfiles/**/*.dockerfile     → image name (strip prefix/suffix)
+            #   tests/<folder>/test.sh          → all images in that folder
+            #   tests/<folder>/<image>.sh       → that specific image
             images=$(
-              echo "$changed" \
-                | grep -E "^(dockerfiles/[^/]+\.dockerfile|tests/[^/]+/)" \
-                | sed 's|^dockerfiles/||; s|\.dockerfile$||; s|^tests/||; s|/.*||' \
-                | sort -u \
-                | while IFS= read -r name; do
-                    [ -f "dockerfiles/${name}.dockerfile" ] && echo "$name"
-                  done \
-                | jq -R -s -c 'split("\n") | map(select(length > 0))'
+              echo "$changed" | while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                case "$f" in
+                  dockerfiles/*.dockerfile)
+                    echo "$f" | sed 's|^dockerfiles/||; s|\.dockerfile$||'
+                    ;;
+                  tests/*/test.sh)
+                    folder=$(echo "$f" | cut -d/ -f2)
+                    # flat image with same name as folder?
+                    [ -f "dockerfiles/${folder}.dockerfile" ] && echo "$folder"
+                    # nested images inside the folder?
+                    find "dockerfiles/${folder}" -name "*.dockerfile" 2>/dev/null \
+                      | sed "s|^dockerfiles/||; s|\.dockerfile$||"
+                    ;;
+                  tests/*/*.sh)
+                    folder=$(echo "$f" | cut -d/ -f2)
+                    img=$(basename "$f" .sh)
+                    [ -f "dockerfiles/${folder}/${img}.dockerfile" ] && echo "${folder}/${img}"
+                    ;;
+                esac
+              done \
+              | sort -u \
+              | while IFS= read -r name; do
+                  [ -z "$name" ] && continue
+                  [ -f "dockerfiles/${name}.dockerfile" ] && echo "$name"
+                done \
+              | jq -R -s -c 'split("\n") | map(select(length > 0))'
             )
           fi
 
@@ -137,19 +163,46 @@ jobs:
 
       - name: Run tests
         run: |
-          test_dir="tests/${{ matrix.image }}"
-          test_script="${test_dir}/test.sh"
+          image="${{ matrix.image }}"
+          image_tag="${{ env.REGISTRY }}/${{ github.repository_owner }}/${image}:ci"
 
-          if [ ! -f "$test_script" ]; then
-            echo "No test script found at $test_script — skipping tests."
-            exit 0
+          if echo "$image" | grep -q '/'; then
+            # Nested image (e.g. developer/alpine):
+            # run shared folder-level test.sh then image-specific <name>.sh
+            test_dir="tests/$(dirname "$image")"
+            img_name="$(basename "$image")"
+            folder_test="${test_dir}/test.sh"
+            image_test="${test_dir}/${img_name}.sh"
+          else
+            # Flat image (e.g. alpine): run test.sh only
+            test_dir="tests/${image}"
+            folder_test="${test_dir}/test.sh"
+            image_test=""
           fi
 
-          echo "Running tests from $test_script …"
-          docker run --rm \
-            --volume "${{ github.workspace }}/${test_dir}:/tests:ro" \
-            "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci" \
-            /bin/sh /tests/test.sh
+          ran_any=false
+
+          if [ -f "$folder_test" ]; then
+            echo "Running folder tests from $folder_test …"
+            docker run --rm \
+              --volume "${{ github.workspace }}/${test_dir}:/tests:ro" \
+              "$image_tag" \
+              /bin/sh /tests/test.sh
+            ran_any=true
+          fi
+
+          if [ -n "$image_test" ] && [ -f "$image_test" ]; then
+            echo "Running image tests from $image_test …"
+            docker run --rm \
+              --volume "${{ github.workspace }}/${test_dir}:/tests:ro" \
+              "$image_tag" \
+              /bin/sh "/tests/$(basename "$image_test")"
+            ran_any=true
+          fi
+
+          if [ "$ran_any" = "false" ]; then
+            echo "No test scripts found — skipping tests."
+          fi
 
   # ──────────────────────────────────────────────
   # Publish

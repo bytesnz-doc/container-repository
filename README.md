@@ -9,16 +9,21 @@ A GitHub-hosted container registry providing base images. Images are built, scan
 ```
 .
 ├── .github/
-│   ├── dependabot.yml               # Automated base-image update PRs
+│   ├── dependabot.yml               # Automated base-image and action update PRs
 │   └── workflows/
 │       ├── ci.yml                   # Build → Scan → Test → Publish pipeline
 │       ├── dependabot-age-check.yml # Reject Dependabot PRs for images < 7 days old
 │       └── dependabot-retry.yml     # Daily: re-check ages and unblock PRs automatically
 ├── dockerfiles/
-│   └── alpine.dockerfile            # One file per image; filename = image name
+│   ├── alpine.dockerfile            # Flat image: filename = image name
+│   └── developer/
+│       └── alpine.dockerfile        # Folder image: folder/filename = image name
 ├── tests/
-│   └── alpine/
-│       └── test.sh                  # One folder per image containing test script(s)
+│   ├── alpine/
+│   │   └── test.sh                  # Tests for the flat alpine image
+│   └── developer/
+│       ├── test.sh                  # Shared tests for ALL developer/* images
+│       └── alpine.sh                # Tests specific to developer/alpine
 └── README.md
 ```
 
@@ -56,13 +61,13 @@ A GitHub-hosted container registry providing base images. Images are built, scan
 
 ### Image naming
 
-Each Dockerfile in `dockerfiles/` is named `<image-name>.dockerfile`.  
-The published image is `ghcr.io/<org>/<image-name>:<tag>`.
+Dockerfiles can live either directly in `dockerfiles/` or in a named subfolder.  
+The published image name mirrors the path relative to `dockerfiles/`.
 
-| Dockerfile                       | Published image                          |
-|----------------------------------|------------------------------------------|
-| `dockerfiles/alpine.dockerfile`  | `ghcr.io/tepapaatawhai/alpine:latest`    |
-| `dockerfiles/ubuntu.dockerfile`  | `ghcr.io/tepapaatawhai/ubuntu:latest`    |
+| Dockerfile                                    | Published image                                    |
+|-----------------------------------------------|----------------------------------------------------|
+| `dockerfiles/alpine.dockerfile`               | `ghcr.io/tepapaatawhai/alpine:latest`              |
+| `dockerfiles/developer/alpine.dockerfile`     | `ghcr.io/tepapaatawhai/developer/alpine:latest`    |
 
 ### Tags
 
@@ -85,11 +90,11 @@ Changes to files outside `dockerfiles/`, `tests/`, or the workflow files do **no
 
 ### Jobs
 
-1. **prepare** — discovers all `*.dockerfile` files and creates a build matrix.
+1. **prepare** — discovers all `*.dockerfile` files (including subfolders) and creates a build matrix filtered to only changed images.
 2. **build-scan-test** — for each image in parallel:
    - Builds the image with [Docker Buildx](https://docs.docker.com/buildx/) (layer cache stored in GitHub Actions cache).
    - Scans the image with [Trivy](https://aquasecurity.github.io/trivy/) for `CRITICAL` and `HIGH` CVEs. Results are uploaded to the **Security → Code scanning** tab as a SARIF report.
-   - Mounts `tests/<image>/` into the running container and executes `test.sh`. If no test script exists the step is skipped without error.
+   - For flat images, mounts `tests/<image>/` and runs `test.sh`. For folder images, mounts `tests/<folder>/` and runs `test.sh` (shared) then `<image>.sh` (specific). Steps are skipped if the scripts don't exist.
 3. **publish** — (main branch only, after scan and test pass) builds the image again from the GHA layer cache and pushes it to GHCR.
 
 ### Dependabot integration
@@ -126,20 +131,19 @@ To enforce the age gate, add `Check base image age` as a **required status check
 
 ### 1. Create the Dockerfile
 
-Add a file to `dockerfiles/` named `<image-name>.dockerfile`:
+Add a file to `dockerfiles/` named `<image-name>.dockerfile`, or create a subfolder for grouped images:
 
 ```dockerfile
-# dockerfiles/myimage.dockerfile
-FROM alpine:3.22
+# dockerfiles/myimage.dockerfile          → ghcr.io/<org>/myimage
+# dockerfiles/mygroup/myimage.dockerfile  → ghcr.io/<org>/mygroup/myimage
+FROM alpine:3.24.1
 
 RUN apk add --no-cache curl
 ```
 
-The filename (without `.dockerfile`) becomes the image name.
+### 2. Create the test scripts
 
-### 2. Create the test folder and test script
-
-Add a test script at `tests/<image-name>/test.sh`:
+For a **flat image** (`dockerfiles/myimage.dockerfile`), add `tests/myimage/test.sh`:
 
 ```sh
 #!/bin/sh
@@ -147,18 +151,22 @@ set -e
 
 echo "=== myimage tests ==="
 
-# Verify curl is installed
 if command -v curl >/dev/null 2>&1; then
-  echo "PASS: curl is available"
+  echo "  PASS: curl is available"
 else
-  echo "FAIL: curl is missing"
+  echo "  FAIL: curl is missing"
   exit 1
 fi
 
 echo "All tests passed!"
 ```
 
-The test script is executed **inside** the built container. The directory `tests/<image-name>/` is mounted read-only at `/tests` and `/bin/sh /tests/test.sh` is run. Exit with a non-zero code to fail the test.
+For a **folder image** (`dockerfiles/mygroup/myimage.dockerfile`), you can add two kinds of tests:
+
+- `tests/mygroup/test.sh` — **shared tests** run for every image in the `mygroup` folder (e.g. common invariants like not running as root).
+- `tests/mygroup/myimage.sh` — **image-specific tests** run only for `mygroup/myimage`.
+
+Both scripts are optional. The test directory `tests/mygroup/` is mounted read-only at `/tests` inside the container, so scripts can access each other via `/tests/<filename>`.
 
 ### 3. Open a pull request
 

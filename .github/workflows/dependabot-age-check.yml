@@ -35,7 +35,7 @@ jobs:
       - name: Identify changed Dockerfiles
         id: changed
         run: |
-          files=$(git diff --name-only refs/remotes/origin/main...HEAD -- 'dockerfiles/*.dockerfile')
+          files=$(git diff --name-only refs/remotes/origin/main...HEAD | grep -E '^dockerfiles/.*\.dockerfile$')
           echo "files<<EOF" >> "$GITHUB_OUTPUT"
           echo "$files"     >> "$GITHUB_OUTPUT"
           echo "EOF"        >> "$GITHUB_OUTPUT"
