@@ -365,6 +365,8 @@ jobs:
         uses: docker/metadata-action@v6.1.0
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}/blob/main/dockerfiles/${{ matrix.image }}.dockerfile
           tags: |
             type=sha,prefix=
             type=raw,value=latest
