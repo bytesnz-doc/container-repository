@@ -236,7 +236,7 @@ jobs:
 
       - name: Publish Trivy summary comment on PR
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v8.0.0
+        uses: actions/github-script@v9.0.0
         env:
           IMAGE_NAME: ${{ matrix.image }}
         with:
