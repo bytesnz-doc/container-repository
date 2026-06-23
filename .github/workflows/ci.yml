@@ -149,7 +149,8 @@ jobs:
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
-          format: sarif
+          format: template
+          template: @contrib/sarif.tpl
           output: trivy-results.sarif
           severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
           ignore-unfixed: false
