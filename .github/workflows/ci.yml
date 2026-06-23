@@ -141,16 +141,15 @@ jobs:
           file: dockerfiles/${{ matrix.image }}.dockerfile
           push: false
           load: true
-          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
+          tags: localhost/${{ matrix.image }}:ci
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
       - name: Scan image with Trivy for SARIF upload
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
-          format: template
-          template: @contrib/sarif.tpl
+          image-ref: localhost/${{ matrix.image }}:ci
+          format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
           ignore-unfixed: false
@@ -166,7 +165,7 @@ jobs:
       - name: Enforce Trivy policy (CRITICAL/HIGH)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
+          image-ref: localhost/${{ matrix.image }}:ci
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
@@ -176,7 +175,7 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
+          image-ref: localhost/${{ matrix.image }}:ci
           format: json
           output: trivy-results-pr.json
           severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
@@ -287,7 +286,7 @@ jobs:
       - name: Run tests
         run: |
           image="${{ matrix.image }}"
-          image_tag="${{ env.REGISTRY }}/${{ github.repository_owner }}/${image}:ci"
+          image_tag="localhost/${image}:ci"
 
           if echo "$image" | grep -q '/'; then
             # Nested image (e.g. developer/alpine):
