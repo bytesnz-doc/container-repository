@@ -50,7 +50,7 @@ jobs:
         id: buildargs
         run: |
           if [ -n "${{ inputs.parent }}" ]; then
-            echo "value=BASE_IMAGE=localhost/${{ inputs.parent }}:ci" >> "$GITHUB_OUTPUT"
+            echo "value=BASE_IMAGE=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.parent }}:ci" >> "$GITHUB_OUTPUT"
           else
             echo "value=" >> "$GITHUB_OUTPUT"
           fi
@@ -62,13 +62,13 @@ jobs:
           file: dockerfiles/${{ inputs.image }}.dockerfile
           push: false
           load: true
-          tags: localhost/${{ inputs.image }}:ci
+          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci
           build-args: ${{ steps.buildargs.outputs.value }}
           cache-from: type=gha,scope=${{ inputs.image }}
           cache-to: type=gha,mode=max,scope=${{ inputs.image }}
 
       - name: Save image artifact
-        run: docker save localhost/${{ inputs.image }}:ci | gzip > ${{ steps.slugs.outputs.image_slug }}.tar.gz
+        run: docker save ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci | gzip > ${{ steps.slugs.outputs.image_slug }}.tar.gz
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v4
@@ -80,7 +80,7 @@ jobs:
       - name: Scan image with Trivy for SARIF upload
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: localhost/${{ inputs.image }}:ci
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
@@ -97,7 +97,7 @@ jobs:
       - name: Enforce Trivy policy (CRITICAL/HIGH)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: localhost/${{ inputs.image }}:ci
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
@@ -107,7 +107,7 @@ jobs:
         if: always() && github.event_name == 'pull_request'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: localhost/${{ inputs.image }}:ci
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci
           format: json
           output: trivy-results-pr.json
           severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
@@ -218,7 +218,7 @@ jobs:
       - name: Run tests
         run: |
           image="${{ inputs.image }}"
-          image_tag="localhost/${image}:ci"
+          image_tag="${{ env.REGISTRY }}/${{ github.repository_owner }}/${image}:ci"
 
           if echo "$image" | grep -q '/'; then
             # Nested image (e.g. developer/alpine):
