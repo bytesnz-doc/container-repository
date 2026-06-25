@@ -19,15 +19,22 @@ env:
 
 jobs:
   # ──────────────────────────────────────────────
-  # Discover which *.dockerfile images have been
-  # changed (or all of them if ci.yml changed) and
-  # expose the list as a JSON array for the matrix
-  # jobs below.
+  # Discover which images to build and group them
+  # into dependency-ordered waves.
   #
-  # Supports nested image folders, e.g.:
-  #   dockerfiles/developer/alpine.dockerfile
-  #   → image name: developer/alpine
-  #   → published:  ghcr.io/<org>/developer/alpine
+  # In-repo dependencies are declared in a
+  # Dockerfile with:
+  #   ARG BASE_IMAGE=ghcr.io/<owner>/<name>:latest
+  #   FROM ${BASE_IMAGE}
+  #
+  # When a parent image changes all downstream
+  # children are automatically included.
+  # Images are sorted into waves so parents always
+  # build before the children that extend them.
+  #
+  # Each wave output is a JSON array of objects:
+  #   [{"image": "alpine", "parent": ""},
+  #    {"image": "developer/alpine", "parent": "alpine"}]
   # ──────────────────────────────────────────────
   prepare:
     name: Discover changed images
@@ -35,91 +42,216 @@ jobs:
     permissions:
       contents: read
     outputs:
-      images: ${{ steps.list.outputs.images }}
+      wave0: ${{ steps.list.outputs.wave0 }}
+      wave1: ${{ steps.list.outputs.wave1 }}
+      wave2: ${{ steps.list.outputs.wave2 }}
+      all:   ${{ steps.list.outputs.all }}
     steps:
       - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
 
-      - name: Detect changed images
+      - name: Build image plan
         id: list
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
-          else
-            base="${{ github.event.before }}"
-          fi
+          python3 << 'PYEOF'
+          import json, os, re, subprocess, sys
+          from pathlib import Path
+          from collections import defaultdict, deque
 
-          # Fall back to empty-tree SHA when there is no previous commit
-          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
-            base=$(git hash-object -t tree /dev/null)
-          fi
+          owner      = os.environ['GITHUB_REPOSITORY_OWNER']
+          event_name = os.environ.get('GITHUB_EVENT_NAME', '')
+          registry   = os.environ.get('REGISTRY', 'ghcr.io')
+          github_out = os.environ['GITHUB_OUTPUT']
 
-          changed=$(git diff --name-only "$base" HEAD)
-          echo "Changed files:"
-          echo "$changed"
+          # -- 1. Build full dependency graph -----------------------
+          parent_of  = {}   # image_name -> in-repo parent (if any)
+          all_images = set()
+          pat = re.compile(
+              r'ARG\s+BASE_IMAGE\s*=\s*'
+              + re.escape(registry) + r'/' + re.escape(owner) + r'/([^:\s]+)',
+              re.IGNORECASE,
+          )
 
-          # If the workflow file itself changed, rebuild every image
-          if echo "$changed" | grep -q "^\.github/workflows/ci\.yml$"; then
-            echo "ci.yml changed — including all images"
-            images=$(
-              find dockerfiles -name "*.dockerfile" \
-                | sed 's|^dockerfiles/||; s|\.dockerfile$||' \
-                | sort \
-                | jq -R -s -c 'split("\n") | map(select(length > 0))'
-            )
-          else
-            # Derive affected image names from changed paths:
-            #   dockerfiles/**/*.dockerfile     → image name (strip prefix/suffix)
-            #   tests/<folder>/test.sh          → all images in that folder
-            #   tests/<folder>/<image>.sh       → that specific image
-            images=$(
-              echo "$changed" | while IFS= read -r f; do
-                [ -z "$f" ] && continue
-                case "$f" in
-                  dockerfiles/*.dockerfile)
-                    echo "$f" | sed 's|^dockerfiles/||; s|\.dockerfile$||'
-                    ;;
-                  tests/*/test.sh)
-                    folder=$(echo "$f" | cut -d/ -f2)
-                    # flat image with same name as folder?
-                    [ -f "dockerfiles/${folder}.dockerfile" ] && echo "$folder"
-                    # nested images inside the folder?
-                    find "dockerfiles/${folder}" -name "*.dockerfile" 2>/dev/null \
-                      | sed "s|^dockerfiles/||; s|\.dockerfile$||"
-                    ;;
-                  tests/*/*.sh)
-                    folder=$(echo "$f" | cut -d/ -f2)
-                    img=$(basename "$f" .sh)
-                    [ -f "dockerfiles/${folder}/${img}.dockerfile" ] && echo "${folder}/${img}"
-                    ;;
-                esac
-              done \
-              | sort -u \
-              | while IFS= read -r name; do
-                  [ -z "$name" ] && continue
-                  [ -f "dockerfiles/${name}.dockerfile" ] && echo "$name"
-                done \
-              | jq -R -s -c 'split("\n") | map(select(length > 0))'
-            )
-          fi
+          for df in sorted(Path('dockerfiles').rglob('*.dockerfile')):
+              name = str(df.relative_to('dockerfiles'))[:-len('.dockerfile')]
+              all_images.add(name)
+              for line in df.read_text().splitlines():
+                  m = pat.match(line.strip())
+                  if m:
+                      parent = m.group(1).rstrip('/')
+                      if Path(f'dockerfiles/{parent}.dockerfile').exists():
+                          parent_of[name] = parent
+                      break
 
-          echo "images=$images" >> "$GITHUB_OUTPUT"
-          echo "Found images: $images"
+          print(f'All images: {sorted(all_images)}', file=sys.stderr)
+          print(f'Dependency graph: {parent_of}',    file=sys.stderr)
+
+          # -- 2. Detect changed files ------------------------------
+          base_sha = (
+              os.environ.get('PR_BASE_SHA') or
+              os.environ.get('PUSH_BEFORE') or ''
+          ).strip()
+          if not base_sha or base_sha == '0' * 40:
+              base_sha = subprocess.check_output(
+                  ['git', 'hash-object', '-t', 'tree', '/dev/null'], text=True
+              ).strip()
+
+          changed = subprocess.check_output(
+              ['git', 'diff', '--name-only', base_sha, 'HEAD'], text=True
+          ).splitlines()
+          print(f'Changed files: {changed}', file=sys.stderr)
+
+          # -- 3. Derive initially-affected images ------------------
+          if any(f == '.github/workflows/ci.yml' for f in changed):
+              print('ci.yml changed -- rebuilding all images', file=sys.stderr)
+              initial = set(all_images)
+          else:
+              initial = set()
+              for f in changed:
+                  p = Path(f)
+                  parts = p.parts
+                  if not parts:
+                      continue
+                  if parts[0] == 'dockerfiles' and f.endswith('.dockerfile'):
+                      name = str(p.relative_to('dockerfiles'))[:-len('.dockerfile')]
+                      if name in all_images:
+                          initial.add(name)
+                  elif parts[0] == 'tests' and len(parts) >= 3:
+                      folder = parts[1]
+                      if p.name == 'test.sh':
+                          for img in all_images:
+                              if img == folder or img.startswith(folder + '/'):
+                                  initial.add(img)
+                      else:
+                          candidate = f'{folder}/{p.stem}'
+                          if candidate in all_images:
+                              initial.add(candidate)
+
+          print(f'Initially affected: {sorted(initial)}', file=sys.stderr)
+
+          # -- 4. Expand to include downstream dependents -----------
+          children_of = defaultdict(list)
+          for child, par in parent_of.items():
+              children_of[par].append(child)
+
+          build_set = set(initial)
+          q = deque(sorted(initial))
+          while q:
+              img = q.popleft()
+              for child in sorted(children_of[img]):
+                  if child not in build_set:
+                      build_set.add(child)
+                      q.append(child)
+
+          print(f'Build set (after expansion): {sorted(build_set)}', file=sys.stderr)
+
+          # -- 5. Topological wave assignment -----------------------
+          wave_of = {}
+
+          def get_wave(img, stack=None):
+              if img in wave_of:
+                  return wave_of[img]
+              stack = (stack or set()) | {img}
+              par = parent_of.get(img)
+              wave_of[img] = (
+                  0 if (par is None or par not in build_set)
+                  else get_wave(par, stack) + 1
+              )
+              return wave_of[img]
+
+          for img in sorted(build_set):
+              get_wave(img)
+
+          waves    = defaultdict(list)
+          max_wave = -1
+          for img in sorted(build_set):
+              w = wave_of[img]
+              waves[w].append(img)
+              max_wave = max(max_wave, w)
+
+          print(f'Waves: {dict(waves)}', file=sys.stderr)
+          if max_wave > 2:
+              print(
+                  f'WARNING: dependency depth {max_wave + 1} exceeds 3 waves; '
+                  f'images in wave {max_wave} will not be built.',
+                  file=sys.stderr,
+              )
+
+          # -- 6. Build matrix include arrays -----------------------
+          def make_include(imgs):
+              return [
+                  {
+                      'image':  img,
+                      'parent': (
+                          parent_of[img]
+                          if img in parent_of and parent_of[img] in build_set
+                          else ''
+                      ),
+                  }
+                  for img in imgs
+              ]
+
+          outputs = {
+              'wave0': json.dumps(make_include(waves.get(0, []))),
+              'wave1': json.dumps(make_include(waves.get(1, []))),
+              'wave2': json.dumps(make_include(waves.get(2, []))),
+              'all':   json.dumps(make_include(sorted(build_set))),
+          }
+
+          with open(github_out, 'a') as fh:
+              for k, v in outputs.items():
+                  fh.write(f'{k}={v}\n')
+
+          for k, v in outputs.items():
+              print(f'{k}={v}')
+          PYEOF
 
   # ──────────────────────────────────────────────
-  # Build → Scan → Test
-  # Runs for every image in parallel.
-  # The scan uploads a SARIF report to the GitHub
-  # Security tab and fails on CRITICAL/HIGH CVEs.
-  # Tests mount tests/<image>/ into the container
-  # and execute test.sh inside it.
+  # CodeQL
+  # Analyses the repository source (GitHub Actions
+  # workflows) for security vulnerabilities and
+  # uploads results to the Security tab.
   # ──────────────────────────────────────────────
-  build-scan-test:
-    name: Build / Scan / Test – ${{ matrix.image }}
-    needs: prepare
-    if: needs.prepare.outputs.images != '[]'
+  codeql:
+    name: CodeQL Analysis
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4.36.2
+        with:
+          languages: actions
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4.36.2
+        with:
+          category: /language:actions
+
+  # ──────────────────────────────────────────────
+  # Build -> Scan -> Test
+  # Wave 0: base images (no in-repo parent).
+  # Wave 1: images that extend a wave-0 image.
+  # Wave 2: images that extend a wave-1 image.
+  #
+  # Each wave downloads its parent's Docker image
+  # artifact (uploaded by the previous wave) and
+  # builds with BASE_IMAGE pointing at that local
+  # image so the in-repo parent is used rather than
+  # pulling from the registry.
+  # ──────────────────────────────────────────────
+  build-wave-0:
+    name: Build / Scan / Test – ${{ matrix.image }}
+    needs: [prepare, codeql]
+    if: needs.prepare.outputs.wave0 != '[]'
     permissions:
       contents: read
       security-events: write
@@ -127,209 +259,74 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJson(needs.prepare.outputs.images) }}
-    steps:
-      - uses: actions/checkout@v7.0.0
+        include: ${{ fromJson(needs.prepare.outputs.wave0) }}
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      image: ${{ matrix.image }}
+      parent: ${{ matrix.parent }}
+    secrets: inherit
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+  build-wave-1:
+    name: Build / Scan / Test – ${{ matrix.image }}
+    needs: [prepare, build-wave-0]
+    if: >
+      always() &&
+      needs.prepare.outputs.wave1 != '[]' &&
+      needs.build-wave-0.result == 'success'
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.wave1) }}
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      image: ${{ matrix.image }}
+      parent: ${{ matrix.parent }}
+    secrets: inherit
 
-      - name: Build image
-        uses: docker/build-push-action@v7.2.0
-        with:
-          context: .
-          file: dockerfiles/${{ matrix.image }}.dockerfile
-          push: false
-          load: true
-          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
-
-      - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
-          format: sarif
-          output: trivy-results.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: "1"
-
-      - name: Upload Trivy SARIF results
-        uses: github/codeql-action/upload-sarif@v4.36.2
-        if: always()
-        with:
-          sarif_file: trivy-results.sarif
-          category: trivy-${{ matrix.image }}
-
-      - name: Scan image with Trivy for PR summary
-        if: github.event_name == 'pull_request'
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:ci
-          format: json
-          output: trivy-results-pr.json
-          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
-          ignore-unfixed: false
-          exit-code: "0"
-
-      - name: Build Trivy PR summary
-        if: github.event_name == 'pull_request'
-        run: |
-          set -euo pipefail
-
-          critical=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results-pr.json)
-          high=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-results-pr.json)
-          medium=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-results-pr.json)
-          low=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-results-pr.json)
-          unknown=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="UNKNOWN")] | length' trivy-results-pr.json)
-          total=$((critical + high + medium + low + unknown))
-
-          {
-            echo "<!-- trivy-pr-comment:${{ matrix.image }} -->"
-            echo "### Trivy results: \`${{ matrix.image }}\`"
-            echo
-            echo "| Severity | Count |"
-            echo "| --- | ---: |"
-            echo "| CRITICAL | ${critical} |"
-            echo "| HIGH | ${high} |"
-            echo "| MEDIUM | ${medium} |"
-            echo "| LOW | ${low} |"
-            echo "| UNKNOWN | ${unknown} |"
-            echo
-            if [ "$total" -eq 0 ]; then
-              echo "No vulnerabilities found."
-            else
-              echo "<details><summary>All findings (${total})</summary>"
-              echo
-              echo "| Severity | ID | Package | Installed | Fixed |"
-              echo "| --- | --- | --- | --- | --- |"
-              jq -r '
-                [.Results[]?.Vulnerabilities[]?]
-                | sort_by(
-                    if .Severity=="CRITICAL" then 0
-                    elif .Severity=="HIGH" then 1
-                    elif .Severity=="MEDIUM" then 2
-                    elif .Severity=="LOW" then 3
-                    else 4 end,
-                    .VulnerabilityID
-                  )
-                | .[]
-                | [
-                    .Severity,
-                    (.VulnerabilityID // "N/A"),
-                    (.PkgName // "N/A"),
-                    (.InstalledVersion // "N/A"),
-                    (if (.FixedVersion // "") == "" then "-" else .FixedVersion end)
-                  ]
-                | @tsv
-              ' trivy-results-pr.json \
-              | while IFS=$'\t' read -r sev id pkg inst fixed; do
-                  printf '| %s | %s | %s | %s | %s |\n' "$sev" "$id" "$pkg" "$inst" "$fixed"
-                done
-              echo
-              echo "</details>"
-            fi
-          } > trivy-pr-summary.md
-
-          cat trivy-pr-summary.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Publish Trivy summary comment on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v8.0.0
-        env:
-          IMAGE_NAME: ${{ matrix.image }}
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('trivy-pr-summary.md', 'utf8');
-            const marker = `<!-- trivy-pr-comment:${process.env.IMAGE_NAME} -->`;
-            const issue_number = context.payload.pull_request.number;
-            const { owner, repo } = context.repo;
-
-            const { data: comments } = await github.rest.issues.listComments({
-              owner,
-              repo,
-              issue_number,
-              per_page: 100
-            });
-
-            const existing = comments.find(
-              (c) => c.user?.type === 'Bot' && c.body?.includes(marker)
-            );
-
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner,
-                repo,
-                comment_id: existing.id,
-                body
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number,
-                body
-              });
-            }
-
-      - name: Run tests
-        run: |
-          image="${{ matrix.image }}"
-          image_tag="${{ env.REGISTRY }}/${{ github.repository_owner }}/${image}:ci"
-
-          if echo "$image" | grep -q '/'; then
-            # Nested image (e.g. developer/alpine):
-            # run shared folder-level test.sh then image-specific <name>.sh
-            test_dir="tests/$(dirname "$image")"
-            img_name="$(basename "$image")"
-            folder_test="${test_dir}/test.sh"
-            image_test="${test_dir}/${img_name}.sh"
-          else
-            # Flat image (e.g. alpine): run test.sh only
-            test_dir="tests/${image}"
-            folder_test="${test_dir}/test.sh"
-            image_test=""
-          fi
-
-          ran_any=false
-
-          if [ -f "$folder_test" ]; then
-            echo "Running folder tests from $folder_test …"
-            docker run --rm \
-              --volume "${{ github.workspace }}/${test_dir}:/tests:ro" \
-              "$image_tag" \
-              /bin/sh /tests/test.sh
-            ran_any=true
-          fi
-
-          if [ -n "$image_test" ] && [ -f "$image_test" ]; then
-            echo "Running image tests from $image_test …"
-            docker run --rm \
-              --volume "${{ github.workspace }}/${test_dir}:/tests:ro" \
-              "$image_tag" \
-              /bin/sh "/tests/$(basename "$image_test")"
-            ran_any=true
-          fi
-
-          if [ "$ran_any" = "false" ]; then
-            echo "No test scripts found — skipping tests."
-          fi
+  build-wave-2:
+    name: Build / Scan / Test – ${{ matrix.image }}
+    needs: [prepare, build-wave-1]
+    if: >
+      always() &&
+      needs.prepare.outputs.wave2 != '[]' &&
+      needs.build-wave-1.result == 'success'
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.wave2) }}
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      image: ${{ matrix.image }}
+      parent: ${{ matrix.parent }}
+    secrets: inherit
 
   # ──────────────────────────────────────────────
   # Publish
-  # Only runs on push to main after all
-  # build-scan-test jobs pass.
-  # Images are tagged with the Git SHA and 'latest'.
+  # Only runs on push to main after all build waves
+  # pass. Published in wave order so parents exist
+  # in the registry before children build.
+  # Children pass BASE_IMAGE pointing at the exact
+  # SHA-tagged parent image just published.
   # ──────────────────────────────────────────────
-  publish:
+  publish-wave-0:
     name: Publish – ${{ matrix.image }}
-    needs: [prepare, build-scan-test]
+    needs: [prepare, build-wave-0, build-wave-1, build-wave-2]
     if: >
+      always() &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
-      needs.prepare.outputs.images != '[]'
+      needs.prepare.outputs.wave0 != '[]' &&
+      needs.build-wave-0.result == 'success' &&
+      (needs.build-wave-1.result == 'success' || needs.build-wave-1.result == 'skipped') &&
+      (needs.build-wave-2.result == 'success' || needs.build-wave-2.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -337,7 +334,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJson(needs.prepare.outputs.images) }}
+        include: ${{ fromJson(needs.prepare.outputs.wave0) }}
     steps:
       - uses: actions/checkout@v7.0.0
 
@@ -356,6 +353,8 @@ jobs:
         uses: docker/metadata-action@v6.1.0
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}/blob/main/dockerfiles/${{ matrix.image }}.dockerfile
           tags: |
             type=sha,prefix=
             type=raw,value=latest
@@ -368,5 +367,69 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  publish-wave-1:
+    name: Publish – ${{ matrix.image }}
+    needs: [prepare, publish-wave-0]
+    if: >
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.prepare.outputs.wave1 != '[]' &&
+      (needs.publish-wave-0.result == 'success' || needs.publish-wave-0.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.wave1) }}
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6.1.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}/blob/main/dockerfiles/${{ matrix.image }}.dockerfile
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: Compute build arguments
+        id: buildargs
+        run: |
+          if [ -n "${{ matrix.parent }}" ]; then
+            sha_short="${{ github.sha }}"
+            sha_short="${sha_short:0:7}"
+            echo "value=BASE_IMAGE=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.parent }}:${sha_short}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7.2.0
+        with:
+          context: .
+          file: dockerfiles/${{ matrix.image }}.dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ steps.buildargs.outputs.value }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}

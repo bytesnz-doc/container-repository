@@ -1,4 +1,5 @@
-FROM alpine:3.24.1
+ARG BASE_IMAGE=ghcr.io/bytesnz-doc/alpine:latest
+FROM ${BASE_IMAGE}
 
 RUN apk add --no-cache sudo \
     && addgroup -S developer \
