@@ -43,10 +43,6 @@ jobs:
           key: ${{ github.run_id }}-image-${{ steps.slugs.outputs.parent_slug }}
           fail-on-cache-miss: true
 
-      - name: Load parent image
-        if: inputs.parent != ''
-        run: docker load < ${{ steps.slugs.outputs.parent_slug }}.tar.gz
-
       - name: Compute build arguments
         id: buildargs
         run: |
@@ -60,18 +56,24 @@ jobs:
             echo "context=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build image
-        uses: docker/build-push-action@v7.2.0
-        with:
-          context: .
-          file: dockerfiles/${{ inputs.image }}.dockerfile
-          push: false
-          load: true
-          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci
-          build-args: ${{ steps.buildargs.outputs.value }}
-          build-contexts: ${{ steps.buildargs.outputs.context }}
-          cache-from: type=gha,scope=${{ inputs.image }}
-          cache-to: type=gha,mode=max,scope=${{ inputs.image }}
+      - name: Load parent image and build
+        run: |
+          if [ -n "${{ inputs.parent }}" ]; then
+            docker load < ${{ steps.slugs.outputs.parent_slug }}.tar.gz
+          fi
+
+          build_args=()
+          [ -n "${{ steps.buildargs.outputs.value }}" ]   && build_args+=(--build-arg "${{ steps.buildargs.outputs.value }}")
+          [ -n "${{ steps.buildargs.outputs.context }}" ] && build_args+=(--build-context "${{ steps.buildargs.outputs.context }}")
+
+          docker buildx build \
+            --file "dockerfiles/${{ inputs.image }}.dockerfile" \
+            --tag "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci" \
+            --load \
+            --cache-from "type=gha,scope=${{ inputs.image }}" \
+            --cache-to "type=gha,mode=max,scope=${{ inputs.image }}" \
+            "${build_args[@]}" \
+            .
 
       - name: Save image to cache
         run: docker save ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci | gzip > ${{ steps.slugs.outputs.image_slug }}.tar.gz
