@@ -35,12 +35,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4.1.0
 
-      - name: Download parent image artifact
+      - name: Restore parent image from cache
         if: inputs.parent != ''
-        uses: actions/download-artifact@v4
+        uses: actions/cache/restore@v4
         with:
-          name: image-${{ steps.slugs.outputs.parent_slug }}
-          path: .
+          path: ${{ steps.slugs.outputs.parent_slug }}.tar.gz
+          key: ${{ github.run_id }}-image-${{ steps.slugs.outputs.parent_slug }}
+          fail-on-cache-miss: true
 
       - name: Load parent image
         if: inputs.parent != ''
@@ -50,9 +51,13 @@ jobs:
         id: buildargs
         run: |
           if [ -n "${{ inputs.parent }}" ]; then
-            echo "value=BASE_IMAGE=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.parent }}:ci" >> "$GITHUB_OUTPUT"
+            # Use a simple context name (no special chars) so BuildKit can
+            # resolve it; the actual image is injected via build-contexts below.
+            echo "value=BASE_IMAGE=ci-parent" >> "$GITHUB_OUTPUT"
+            echo "context=ci-parent=docker-image://${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.parent }}:ci" >> "$GITHUB_OUTPUT"
           else
             echo "value=" >> "$GITHUB_OUTPUT"
+            echo "context=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build image
@@ -64,18 +69,18 @@ jobs:
           load: true
           tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci
           build-args: ${{ steps.buildargs.outputs.value }}
+          build-contexts: ${{ steps.buildargs.outputs.context }}
           cache-from: type=gha,scope=${{ inputs.image }}
           cache-to: type=gha,mode=max,scope=${{ inputs.image }}
 
-      - name: Save image artifact
+      - name: Save image to cache
         run: docker save ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci | gzip > ${{ steps.slugs.outputs.image_slug }}.tar.gz
 
-      - name: Upload image artifact
-        uses: actions/upload-artifact@v4
+      - name: Cache image tarball
+        uses: actions/cache/save@v4
         with:
-          name: image-${{ steps.slugs.outputs.image_slug }}
           path: ${{ steps.slugs.outputs.image_slug }}.tar.gz
-          retention-days: 1
+          key: ${{ github.run_id }}-image-${{ steps.slugs.outputs.image_slug }}
 
       - name: Scan image with Trivy for SARIF upload
         uses: aquasecurity/trivy-action@v0.36.0
