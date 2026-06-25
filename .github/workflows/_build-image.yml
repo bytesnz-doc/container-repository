@@ -58,9 +58,12 @@ jobs:
 
       - name: Load parent image and build
         run: |
+          set -v
           if [ -n "${{ inputs.parent }}" ]; then
             docker load < ${{ steps.slugs.outputs.parent_slug }}.tar.gz
           fi
+
+          docker images
 
           build_args=()
           [ -n "${{ steps.buildargs.outputs.value }}" ]   && build_args+=(--build-arg "${{ steps.buildargs.outputs.value }}")
@@ -70,8 +73,6 @@ jobs:
             --file "dockerfiles/${{ inputs.image }}.dockerfile" \
             --tag "${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci" \
             --load \
-            --cache-from "type=gha,scope=${{ inputs.image }}" \
-            --cache-to "type=gha,mode=max,scope=${{ inputs.image }}" \
             "${build_args[@]}" \
             .
 
