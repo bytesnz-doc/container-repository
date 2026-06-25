@@ -1,0 +1,259 @@
+name: _Build, Scan and Test image
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Image name (e.g. developer/alpine)
+        type: string
+        required: true
+      parent:
+        description: In-repo parent image name to load locally (empty if none)
+        type: string
+        required: false
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-scan-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - name: Compute slugs
+        id: slugs
+        run: |
+          echo "image_slug=$(echo '${{ inputs.image }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+          echo "parent_slug=$(echo '${{ inputs.parent }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Download parent image artifact
+        if: inputs.parent != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: image-${{ steps.slugs.outputs.parent_slug }}
+          path: .
+
+      - name: Load parent image
+        if: inputs.parent != ''
+        run: docker load < ${{ steps.slugs.outputs.parent_slug }}.tar.gz
+
+      - name: Compute build arguments
+        id: buildargs
+        run: |
+          if [ -n "${{ inputs.parent }}" ]; then
+            echo "value=BASE_IMAGE=localhost/${{ inputs.parent }}:ci" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build image
+        uses: docker/build-push-action@v7.2.0
+        with:
+          context: .
+          file: dockerfiles/${{ inputs.image }}.dockerfile
+          push: false
+          load: true
+          tags: localhost/${{ inputs.image }}:ci
+          build-args: ${{ steps.buildargs.outputs.value }}
+          cache-from: type=gha,scope=${{ inputs.image }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image }}
+
+      - name: Save image artifact
+        run: docker save localhost/${{ inputs.image }}:ci | gzip > ${{ steps.slugs.outputs.image_slug }}.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ steps.slugs.outputs.image_slug }}
+          path: ${{ steps.slugs.outputs.image_slug }}.tar.gz
+          retention-days: 1
+
+      - name: Scan image with Trivy for SARIF upload
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: localhost/${{ inputs.image }}:ci
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
+          ignore-unfixed: false
+          exit-code: "0"
+
+      - name: Upload Trivy SARIF results
+        uses: github/codeql-action/upload-sarif@v4.36.2
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-${{ inputs.image }}
+
+      - name: Enforce Trivy policy (CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: localhost/${{ inputs.image }}:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Scan image with Trivy for PR summary
+        if: always() && github.event_name == 'pull_request'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: localhost/${{ inputs.image }}:ci
+          format: json
+          output: trivy-results-pr.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
+          ignore-unfixed: false
+          exit-code: "0"
+
+      - name: Build Trivy PR summary
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+
+          critical=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results-pr.json)
+          high=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-results-pr.json)
+          medium=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-results-pr.json)
+          low=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-results-pr.json)
+          unknown=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="UNKNOWN")] | length' trivy-results-pr.json)
+          total=$((critical + high + medium + low + unknown))
+
+          {
+            echo "<!-- trivy-pr-comment:${{ inputs.image }} -->"
+            echo "### Trivy results: \`${{ inputs.image }}\`"
+            echo
+            echo "| Severity | Count |"
+            echo "| --- | ---: |"
+            echo "| CRITICAL | ${critical} |"
+            echo "| HIGH | ${high} |"
+            echo "| MEDIUM | ${medium} |"
+            echo "| LOW | ${low} |"
+            echo "| UNKNOWN | ${unknown} |"
+            echo
+            if [ "$total" -eq 0 ]; then
+              echo "No vulnerabilities found."
+            else
+              echo "<details><summary>All findings (${total})</summary>"
+              echo
+              echo "| Severity | ID | Package | Installed | Fixed |"
+              echo "| --- | --- | --- | --- | --- |"
+              jq -r '
+                [.Results[]?.Vulnerabilities[]?]
+                | sort_by(
+                    if .Severity=="CRITICAL" then 0
+                    elif .Severity=="HIGH" then 1
+                    elif .Severity=="MEDIUM" then 2
+                    elif .Severity=="LOW" then 3
+                    else 4 end,
+                    .VulnerabilityID
+                  )
+                | .[]
+                | [
+                    .Severity,
+                    (.VulnerabilityID // "N/A"),
+                    (.PkgName // "N/A"),
+                    (.InstalledVersion // "N/A"),
+                    (if (.FixedVersion // "") == "" then "-" else .FixedVersion end)
+                  ]
+                | @tsv
+              ' trivy-results-pr.json \
+              | while IFS=$'\t' read -r sev id pkg inst fixed; do
+                  printf '| %s | %s | %s | %s | %s |\n' "$sev" "$id" "$pkg" "$inst" "$fixed"
+                done
+              echo
+              echo "</details>"
+            fi
+          } > trivy-pr-summary.md
+
+          cat trivy-pr-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish Trivy summary comment on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v8.0.0
+        env:
+          IMAGE_NAME: ${{ inputs.image }}
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('trivy-pr-summary.md', 'utf8');
+            const marker = `<!-- trivy-pr-comment:${process.env.IMAGE_NAME} -->`;
+            const issue_number = context.payload.pull_request.number;
+            const { owner, repo } = context.repo;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner,
+              repo,
+              issue_number,
+              per_page: 100
+            });
+
+            const existing = comments.find(
+              (c) => c.user?.type === 'Bot' && c.body?.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body
+              });
+            }
+
+      - name: Run tests
+        run: |
+          image="${{ inputs.image }}"
+          image_tag="localhost/${image}:ci"
+
+          if echo "$image" | grep -q '/'; then
+            # Nested image (e.g. developer/alpine):
+            # run shared folder-level test.sh then image-specific <name>.sh
+            test_dir="tests/$(dirname "$image")"
+            img_name="$(basename "$image")"
+            folder_test="${test_dir}/test.sh"
+            image_test="${test_dir}/${img_name}.sh"
+          else
+            # Flat image (e.g. alpine): run test.sh only
+            test_dir="tests/${image}"
+            folder_test="${test_dir}/test.sh"
+            image_test=""
+          fi
+
+          ran_any=false
+
+          if [ -f "$folder_test" ]; then
+            echo "Running folder tests from $folder_test …"
+            docker run --rm \
+              --volume "${{ github.workspace }}/${test_dir}:/tests:ro" \
+              "$image_tag" \
+              /bin/sh /tests/test.sh
+            ran_any=true
+          fi
+
+          if [ -n "$image_test" ] && [ -f "$image_test" ]; then
+            echo "Running image tests from $image_test …"
+            docker run --rm \
+              --volume "${{ github.workspace }}/${test_dir}:/tests:ro" \
+              "$image_tag" \
+              /bin/sh "/tests/$(basename "$image_test")"
+            ran_any=true
+          fi
+
+          if [ "$ran_any" = "false" ]; then
+            echo "No test scripts found — skipping tests."
+          fi
