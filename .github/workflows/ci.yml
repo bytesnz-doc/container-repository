@@ -320,7 +320,6 @@ jobs:
     name: Publish – ${{ matrix.image }}
     needs: [prepare, build-wave-0, build-wave-1, build-wave-2]
     if: >
-      always() &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
       needs.prepare.outputs.wave0 != '[]' &&
@@ -374,7 +373,6 @@ jobs:
     name: Publish – ${{ matrix.image }}
     needs: [prepare, publish-wave-0]
     if: >
-      always() &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
       needs.prepare.outputs.wave1 != '[]' &&
