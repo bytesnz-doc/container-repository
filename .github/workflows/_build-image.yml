@@ -84,43 +84,7 @@ jobs:
         with:
           path: ${{ steps.slugs.outputs.image_slug }}.tar.gz
           key: ${{ github.run_id }}-image-${{ steps.slugs.outputs.image_slug }}
-
-      - name: Scan image with Trivy for SARIF upload
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci
-          format: sarif
-          output: trivy-results.sarif
-          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
-          ignore-unfixed: false
-          exit-code: "0"
-
-      - name: Upload Trivy SARIF results
-        uses: github/codeql-action/upload-sarif@v4.36.2
-        if: always()
-        with:
-          sarif_file: trivy-results.sarif
-          category: trivy-${{ inputs.image }}
-
-      - name: Enforce Trivy policy (CRITICAL/HIGH)
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci
-          format: table
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: "1"
-
-      - name: Scan image with Trivy for PR summary
-        if: always() && github.event_name == 'pull_request'
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci
-          format: json
-          output: trivy-results-pr.json
-          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
-          ignore-unfixed: false
-          exit-code: "0"
+          
 
       - name: Build Trivy PR summary
         if: always() && github.event_name == 'pull_request'
@@ -222,6 +186,43 @@ jobs:
                 body
               });
             }
+
+      - name: Scan image with Trivy for SARIF upload
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
+          ignore-unfixed: false
+          exit-code: "0"
+
+      - name: Upload Trivy SARIF results
+        uses: github/codeql-action/upload-sarif@v4.36.2
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-${{ inputs.image }}
+
+      - name: Enforce Trivy policy (CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Scan image with Trivy for PR summary
+        if: always() && github.event_name == 'pull_request'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image }}:ci
+          format: json
+          output: trivy-results-pr.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
+          ignore-unfixed: false
+          exit-code: "0"
 
       - name: Run tests
         run: |
