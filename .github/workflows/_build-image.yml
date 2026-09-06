@@ -33,7 +33,7 @@ jobs:
           echo "parent_slug=$(echo '${{ inputs.parent }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+        uses: docker/setup-buildx-action@v4.3.0
 
       - name: Restore parent image from cache
         if: inputs.parent != ''
